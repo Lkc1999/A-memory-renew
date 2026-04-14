@@ -1,4 +1,3 @@
-import keyword
 from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
@@ -6,6 +5,7 @@ from .llm_controller import LLMController
 from .retrievers import ChromaRetriever
 import json
 import logging
+from .evaluator import NoteEvaluator, RevisionAgent
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 import numpy as np
@@ -97,7 +97,9 @@ class AgenticMemorySystem:
                  evo_threshold: int = 100,
                  api_key: Optional[str] = None,
                  sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000):
+                 sglang_port: int = 30000,
+                 enable_evaluator: bool = True,
+                 evaluation_max_retries: int = 3):
         """Initialize the memory system.
 
         Args:
@@ -108,6 +110,8 @@ class AgenticMemorySystem:
             api_key: API key for the LLM service
             sglang_host: Host URL for SGLang server (default: http://localhost)
             sglang_port: Port for SGLang server (default: 30000)
+            enable_evaluator: Whether to enable the Evaluator for note quality assessment
+            evaluation_max_retries: Maximum retries for evaluation before accepting
         """
         self.memories = {}
         self.model_name = model_name
@@ -126,6 +130,13 @@ class AgenticMemorySystem:
         self.llm_controller = LLMController(llm_backend, llm_model, api_key, sglang_host, sglang_port)
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
+
+        # Initialize Evaluator components (harness architecture)
+        self.enable_evaluator = enable_evaluator
+        self.evaluation_max_retries = evaluation_max_retries
+        if self.enable_evaluator:
+            self.evaluator = NoteEvaluator(self.llm_controller)
+            self.revision_agent = RevisionAgent(self.llm_controller)
 
         # Evolution system prompt
         self._evolution_system_prompt = '''
@@ -234,39 +245,86 @@ class AgenticMemorySystem:
             print(f"Error analyzing content: {e}")
             return {"keywords": [], "context": "General", "tags": []}
 
-    def add_note(self, content: str, time: str = None, **kwargs) -> str:
-        """Add a new memory note"""
+    def add_note(self, content: str, time: str = None, skip_evaluation: bool = False, **kwargs) -> str:
+        """Add a new memory note with optional evaluation.
+
+        Args:
+            content: The content of the memory note
+            time: Optional timestamp
+            skip_evaluation: If True, skip the evaluator assessment (for testing/internal use)
+            **kwargs: Additional note attributes
+
+        Returns:
+            str: The memory note ID, or a dict with status info if evaluation is enabled
+        """
         # Create MemoryNote without llm_controller
         if time is not None:
             kwargs['timestamp'] = time
         note = MemoryNote(content=content, **kwargs)
-        
+
         # 🔧 LLM Analysis Enhancement: Auto-generate attributes using LLM if they are empty or default values
         needs_analysis = (
             not note.keywords or  # keywords is empty list
             note.context == "General" or  # context is default value
             not note.tags  # tags is empty list
         )
-        
+
         if needs_analysis:
-            # try:
             analysis = self.analyze_content(content)
-            
+
             # Only update attributes that are not provided or have default values
             if not note.keywords:
                 note.keywords = analysis.get("keywords", [])
             if note.context == "General":
-                note.context = analysis.get("context", "General") 
+                note.context = analysis.get("context", "General")
             if not note.tags:
                 note.tags = analysis.get("tags", [])
-                    
-            # except Exception as e:
-            #     print(f"Warning: LLM analysis failed, using default values: {e}")
-        
+
+        # 🔍 Evaluator Integration (Harness Architecture)
+        if self.enable_evaluator and not skip_evaluation:
+            # Get related memories for consistency check
+            related_memories = self._get_related_for_evaluation(note)
+
+            # Run Evaluator assessment
+            evaluation = self.evaluator.evaluate(
+                note_content=note.content,
+                note_context=note.context,
+                note_keywords=note.keywords,
+                note_tags=note.tags,
+                related_memories=related_memories
+            )
+
+            # Log evaluation for debugging
+            logger.info(f"Note evaluation: decision={evaluation['decision']}, "
+                       f"overall_score={evaluation['overall_score']}")
+
+            if evaluation['decision'] == 'ACCEPT':
+                # Proceed with storage
+                pass
+            elif evaluation['decision'] == 'REVISE':
+                # Try revision with RevisionAgent
+                if evaluation.get('revision_suggestions'):
+                    revised = self.revision_agent.revise(
+                        note_content=note.content,
+                        note_context=note.context,
+                        note_keywords=note.keywords,
+                        note_tags=note.tags,
+                        revision_suggestions=evaluation['revision_suggestions']
+                    )
+                    # Update note with revised fields
+                    note.content = revised.get('content', note.content)
+                    note.context = revised.get('context', note.context)
+                    note.keywords = revised.get('keywords', note.keywords)
+                    note.tags = revised.get('tags', note.tags)
+                    logger.info(f"Note revised based on evaluator feedback")
+
+            # If REJECT after revision attempts, optionally reject
+            # For now, we still store but could add a flag
+
         # Update retriever with all documents
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        
+
         # Add to ChromaDB with complete metadata
         metadata = {
             "id": note.id,
@@ -282,12 +340,22 @@ class AgenticMemorySystem:
             "tags": note.tags
         }
         self.retriever.add_document(note.content, metadata, note.id)
-        
+
         if evo_label == True:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
                 self.consolidate_memories()
+
         return note.id
+
+    def _get_related_for_evaluation(self, note: MemoryNote, k: int = 5) -> List[Dict[str, Any]]:
+        """Get related memories for evaluator's consistency check."""
+        try:
+            results = self.search(note.content, k=k)
+            return results
+        except Exception as e:
+            logger.warning(f"Error getting related memories for evaluation: {e}")
+            return []
     
     def consolidate_memories(self):
         """Consolidate memories: update retriever with new documents"""
