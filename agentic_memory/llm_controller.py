@@ -5,6 +5,13 @@ from abc import ABC, abstractmethod
 from litellm import completion
 import requests
 
+# Load .env file if exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, use environment variables directly
+
 class BaseLLMController(ABC):
     @abstractmethod
     def get_completion(self, prompt: str) -> str:
