@@ -211,13 +211,115 @@ class OpenRouterController(BaseLLMController):
             empty_response = self._generate_empty_response(response_format)
             return json.dumps(empty_response)
 
+
+class DashScopeController(BaseLLMController):
+    """LLM controller for Alibaba Cloud DashScope API.
+
+    DashScope provides access to various LLMs from Alibaba Cloud including
+    the Qwen series models.
+
+    Args:
+        model: Model identifier (e.g., "qwen-turbo", "qwen-plus", "qwen-max").
+               Common models: qwen-turbo, qwen-plus, qwen-max, qwen-max-longcontext.
+        api_key: DashScope API key. If None, reads from DASHSCOPE_API_KEY env variable.
+
+    Raises:
+        ValueError: If API key is not provided and not found in environment.
+
+    Examples:
+        >>> controller = DashScopeController("qwen-plus", api_key="your-key")
+        >>> controller = DashScopeController("qwen-max")
+
+    Note:
+        Sign up at https://dashscope.console.aliyun.com/ to get an API key.
+    """
+
+    def __init__(self, model: str = "qwen-plus", api_key: Optional[str] = None):
+        self.model = model
+
+        if api_key is None:
+            api_key = os.getenv('DASHSCOPE_API_KEY')
+        if api_key is None:
+            raise ValueError("DashScope API key not found. Set DASHSCOPE_API_KEY environment variable.")
+
+        self.api_key = api_key
+        self.base_url = "https://dashscope.aliyuncs.com/api/v1"
+
+    def get_completion(self, prompt: str, response_format: dict, temperature: float = 1.0) -> str:
+        """Get completion from DashScope API.
+
+        Args:
+            prompt: The prompt to send to the LLM.
+            response_format: JSON schema specifying the expected response format.
+            temperature: Sampling temperature (0.0 to 1.0).
+
+        Returns:
+            JSON string containing the LLM response.
+        """
+        try:
+            import requests
+
+            # Extract JSON schema for DashScope
+            json_schema = None
+            if response_format and "json_schema" in response_format:
+                json_schema = response_format["json_schema"].get("schema", {})
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+
+            payload = {
+                "model": self.model,
+                "input": {
+                    "prompt": prompt
+                },
+                "parameters": {
+                    "temperature": temperature,
+                    "result_format": "message"
+                }
+            }
+
+            if json_schema:
+                payload["parameters"]["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": json_schema
+                }
+
+            response = requests.post(
+                f"{self.base_url}/services/aigc/text-generation/generation",
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                # Parse DashScope response format
+                if "output" in result and "text" in result["output"]:
+                    return result["output"]["text"]
+                elif "output" in result and "choices" in result["output"]:
+                    # Alternative format
+                    choices = result["output"]["choices"]
+                    if choices and len(choices) > 0:
+                        return choices[0].get("message", {}).get("content", "")
+                return ""
+            else:
+                print(f"DashScope API error: {response.status_code} - {response.text}")
+                raise Exception(f"DashScope API error: {response.status_code}")
+
+        except Exception as e:
+            print(f"DashScope completion error: {e}")
+            empty_response = self._generate_empty_response(response_format)
+            return json.dumps(empty_response)
+
 class LLMController:
     """LLM-based controller for memory metadata generation.
 
-    Supports multiple backends: OpenAI, Ollama, SGLang, and OpenRouter.
+    Supports multiple backends: OpenAI, Ollama, SGLang, OpenRouter, and DashScope (Alibaba Cloud).
     """
     def __init__(self,
-                 backend: Literal["openai", "ollama", "sglang", "openrouter"] = "openai",
+                 backend: Literal["openai", "ollama", "sglang", "openrouter", "dashscope"] = "openai",
                  model: str = "gpt-4",
                  api_key: Optional[str] = None,
                  sglang_host: str = "http://localhost",
@@ -230,8 +332,10 @@ class LLMController:
             self.llm = SGLangController(model, sglang_host, sglang_port)
         elif backend == "openrouter":
             self.llm = OpenRouterController(model, api_key)
+        elif backend == "dashscope":
+            self.llm = DashScopeController(model, api_key)
         else:
-            raise ValueError("Backend must be one of: 'openai', 'ollama', 'sglang', 'openrouter'")
+            raise ValueError("Backend must be one of: 'openai', 'ollama', 'sglang', 'openrouter', 'dashscope'")
 
     def get_completion(self, prompt: str, response_format: dict = None, temperature: float = 1.0) -> str:
         return self.llm.get_completion(prompt, response_format, temperature)
