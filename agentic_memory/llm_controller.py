@@ -266,20 +266,21 @@ class DashScopeController(BaseLLMController):
         try:
             import requests
 
-            # Extract JSON schema for DashScope
-            json_schema = None
-            if response_format and "json_schema" in response_format:
-                json_schema = response_format["json_schema"].get("schema", {})
-
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
 
+            # Build messages format for DashScope
+            messages = [
+                {"role": "system", "content": "You must respond with a JSON object."},
+                {"role": "user", "content": prompt}
+            ]
+
             payload = {
                 "model": self.model,
                 "input": {
-                    "prompt": prompt
+                    "messages": messages
                 },
                 "parameters": {
                     "temperature": temperature,
@@ -287,11 +288,18 @@ class DashScopeController(BaseLLMController):
                 }
             }
 
-            if json_schema:
-                payload["parameters"]["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": json_schema
-                }
+            # Handle response format - DashScope supports json_object and json_schema
+            if response_format:
+                if "json_schema" in response_format:
+                    json_schema_def = response_format["json_schema"]
+                    # DashScope requires the full json_schema object with name
+                    payload["parameters"]["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": json_schema_def
+                    }
+                else:
+                    # Use json_object mode
+                    payload["parameters"]["response_format"] = {"type": "json_object"}
 
             response = requests.post(
                 f"{self.base_url}/services/aigc/text-generation/generation",
@@ -303,13 +311,17 @@ class DashScopeController(BaseLLMController):
             if response.status_code == 200:
                 result = response.json()
                 # Parse DashScope response format
-                if "output" in result and "text" in result["output"]:
-                    return result["output"]["text"]
-                elif "output" in result and "choices" in result["output"]:
-                    # Alternative format
-                    choices = result["output"]["choices"]
-                    if choices and len(choices) > 0:
-                        return choices[0].get("message", {}).get("content", "")
+                if "output" in result:
+                    output = result["output"]
+                    if "text" in output:
+                        return output["text"]
+                    elif "choices" in output:
+                        choices = output["choices"]
+                        if choices and len(choices) > 0:
+                            return choices[0].get("message", {}).get("content", "")
+                    elif "finish_reason" in output:
+                        # Alternative format
+                        return output.get("text", "")
                 return ""
             else:
                 print(f"DashScope API error: {response.status_code} - {response.text}")
